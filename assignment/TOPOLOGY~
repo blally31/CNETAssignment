@@ -1,0 +1,86 @@
+compile			= "assignment.c"
+winopen = true
+maxmessagesize = 255bytes
+probframeloss = 10
+probframecorrupt = 10
+
+bandwidth = 56Kbps,
+messagerate = 1000ms,  
+propagationdelay = 2500ms,
+
+host Australia {
+    x=400, y=200
+    winx=900, winy=300
+    address = 0
+    outputfile = "Australia.log"
+    link to Indonesia {
+    }
+    link to NewZealand {
+    }
+    link to Fiji {
+    }
+}
+
+host Indonesia {
+    winx=300, winy=300
+    address = 1
+    outputfile = "Indonesia.log"
+    west west of Australia
+    link to Australia {
+    }
+    link to Brunei {
+    }
+    link to Malaysia {
+    }
+    link to Singapore {
+    }
+}
+
+host NewZealand {
+    winx=1200, winy=500
+    address = 2
+    outputfile = "NewZealand.log"
+    south east of Australia
+    link to Australia {
+    }
+}
+
+host Fiji {
+    winx=1200, winy=5
+    address = 3
+    outputfile = "Fiji.log"
+    north east of Australia
+    link to Australia {
+    }
+}
+
+host Brunei {
+    winx=600, winy=5
+    address = 4
+    outputfile = "Brunei.log"
+    north of Indonesia
+    link to Indonesia {
+    }
+}
+
+host Singapore {
+    winx=5, winy=500
+    address = 6
+    outputfile = "Singapore.log"
+    south west of Indonesia
+    link to Malaysia {
+    }
+    link to Indonesia {
+    }
+}
+
+host Malaysia {
+    winx=5, winy=5
+    address = 5
+    outputfile = "Malaysia.log"
+    north west of Indonesia
+    link to Indonesia {
+    }
+    link to Singapore {
+    }
+}

@@ -1,0 +1,418 @@
+#include <cnet.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include "stopandwait.h"
+
+#define TRUE 1
+#define FALSE !TRUE
+
+static int setup = TRUE;
+int* ackExpected;
+int* frameExpected;
+int* nextFrameToSend;
+CnetTimerID** lasttimer;
+LinkedList** frameQueue;
+LinkedList** overflowQueue;
+
+EVENT_HANDLER(application_downto_network)
+{
+    CnetAddr destaddr;
+    MSG message;
+    Packet packet;
+    size_t length = sizeof(MSG);
+    /* Obtains a new message to be delivered. destaddr will have the network address of
+      the required destination node */
+    CHECK(CNET_read_application(&destaddr, (char*)&message.data, &length));
+
+    printf("MESSAGE = %s of length %d FOR DESTADDR = %d\n", message.data, length, destaddr);
+
+    /* Construct packet using message and source/dest addresses */
+    memcpy(&packet.data, &message, length);
+    packet.src_addr = nodeinfo.nodenumber;
+    packet.dest_addr = destaddr;
+    packet.msglen = length;
+    
+    network_downto_datalink(packet);
+}
+
+/* Deals with updating the send queue nextFrameToSend */
+void network_downto_datalink(Packet packet)
+{
+    Frame frame;
+    int i;
+    size_t psize = sizeof(Packet);
+    
+    /*Determine which link to send the frame on */
+    int link = routing[nodeinfo.nodenumber][packet.dest_addr];
+
+    /* Initialise all the fields in frame */
+    frame.kind = DL_DATA;
+    frame.seqno = nextFrameToSend[link];
+    memcpy(&frame.packet, &packet, psize);
+    frame.length = packet.msglen;
+    frame.checksum = 0;
+    /* Increment the next frame to send */
+    nextFrameToSend[link] = ++nextFrameToSend[link] % MAX_SEQ_NUM;
+    
+    /* Calculates the checksum */
+    frame.checksum = CNET_ccitt((unsigned char *)&frame, sizeof(frame));
+
+    /* If Aus or Indo then use a larger window size */
+    if (nodeinfo.nodenumber == 0 || nodeinfo.nodenumber == 1)
+    {
+        if (frameQueue[link]->size >= SWITCHSIZE)
+        {
+            for (i = 0; i < NUMNODES; i++)
+            {
+                if (routing[nodeinfo.address][i] == link)
+                {
+                    CNET_disable_application(i);
+                }
+            }
+            /* Add the next frame to the overflow buffer */
+            addFrame(overflowQueue[link], frame);
+            CNET_set_LED(link, "red");
+        }
+        else
+        {
+            /*Add the newly created frame to the queue */
+            addFrame(frameQueue[link], frame);
+            datalink_downto_physical(frame, link);
+            CNET_set_LED(link, "green");
+        }
+    }
+    else
+    {
+        if(frameQueue[link]->size >= WINDOWSIZE)
+        {
+            /* Check each link from the current node and disable their message gen to current link*/
+            for(i = 0; i < NUMNODES; i++)
+            {
+                if(routing[nodeinfo.address][i] == link)
+                {
+                    CNET_disable_application(i);
+                }
+            }
+            /* Add the next frame to the overflow buffer */
+            addFrame(overflowQueue[link], frame);
+            CNET_set_LED(link, "red");
+        }
+        else
+        {
+            /*Add the newly created frame to the queue */
+            addFrame(frameQueue[link], frame);
+            datalink_downto_physical(frame, link);
+            CNET_set_LED(link, "green");
+        }
+    }  
+}
+
+
+/*Transmit Frame*/
+static void datalink_downto_physical(Frame frame, int link)
+{
+    size_t length = sizeof(frame);
+    switch (frame.kind) 
+    {
+        /* Acknowledgment frame*/
+        case DL_ACK:
+        {
+            printf("ACK transmitted with seqno=%d, on link %d\n", frame.seqno, link);
+            break;
+        }
+        /* Data frame*/
+        case DL_DATA: 
+        {
+            CnetTime timeout;
+
+            printf("DATA transmitted with seqno=%d, on link %d\n", frame.seqno, link);
+
+            /* Calculates the time delivery time = Transmission Time + Propagation Delay*/
+            timeout = length*((CnetTime)8000000 / linkinfo[link].bandwidth) +
+                        linkinfo[link].propagationdelay;
+
+            /* Create a new timer based on the link the frame is traveling on */
+            lasttimer[link][frame.seqno] = CNET_start_timer(EV_TIMER1, 3 * timeout, (CnetData)link);
+            break;
+        }
+    }
+    /* Pass Frame to the CNET physical layer to send Frame along link. */
+    CHECK(CNET_write_physical(link, &frame, &length));
+}
+
+/* Just received a new Frame. Depending on whether an AcK or Data update queues*/
+EVENT_HANDLER(physical_upto_datalink)
+{
+    Frame frame, frame1, ack;
+    size_t length;
+    int link, checksum, checksumExp, difference, i, j, k;
+
+    length = sizeof(Frame);
+    /* Read data frame from the physical layer*/
+    CHECK(CNET_read_physical(&link, &frame, &length));
+
+    checksum = frame.checksum;
+    frame.checksum = 0;
+
+    checksumExp = CNET_ccitt((unsigned char *)&frame, sizeof(frame));
+    /* Check if the checksum is correct. ie the same as expected */
+    if( checksumExp != checksum) 
+    {
+        printf("\t\t\t\tBAD checksum - frame ignored\n");
+        return;
+    }
+
+    switch (frame.kind) 
+    {
+        case DL_ACK:
+            printf("ACK EXPECTED %d ON LINK %d\n", ackExpected[link], link);
+            printf("ACK ACTUAL %d\n", frame.seqno);
+            
+            /* Check if the the ackowledement frame is the same or later than expected*/
+            if (frame.seqno >= ackExpected[link]) 
+            {
+                difference = frame.seqno - ackExpected[link] /*- frame.seqno*/;
+                /* Stop the timer for all outstanding acknowledgments up to the received */
+                for (i = difference; i >= 0; i--)
+                {
+                    CHECK(CNET_stop_timer(lasttimer[link][(ackExpected[link] + i) % MAX_SEQ_NUM]));
+                }
+            }
+            else
+            {
+                difference = frame.seqno + (MAX_SEQ_NUM - ackExpected[link]);
+                /* Stop the timer for all outstanding acknowledgments up to the received */
+                for (i = difference; i >= 0; i--)
+                {
+                    int seq;
+
+                    seq = frame.seqno - i;
+                   
+                    CHECK(CNET_stop_timer(lasttimer[link][(MAX_SEQ_NUM + seq) % MAX_SEQ_NUM]));
+                }
+            }
+
+            printf("\t\t\t\tACK received with seqno=%d, from link %d\n", frame.seqno, link);
+            ackExpected[link] = frame.seqno + 1;
+
+            /* Add Frames from the overflow buffer to the queue and send them */
+            for (k = 0; k <= difference; k++)
+            {
+                CNET_set_LED(link, "green");
+                removeFrame(frameQueue[link]);
+                /* Add a new frame to the frameQueue from the overflowQueue */
+                if (overflowQueue[link]->size != 0)
+                {
+                    frame1 = peekFirst(overflowQueue[link]);
+                    addFrame(frameQueue[link], frame1);
+                    removeFrame(overflowQueue[link]);
+                    datalink_downto_physical(frame1, link);
+                }
+                /* Enables the generation of new messages for delivery to other nodes*/
+                for (j = 0; j < NUMNODES; j++)
+                {
+                    if (routing[nodeinfo.address][j] == link)
+                    {
+                        CNET_enable_application(j);
+                    }
+                }
+            } 
+    	break;
+
+        case DL_DATA:
+            printf("FRAME EXPECTED %d ON LINK %d\n", frameExpected[link], link);
+            printf("FRAME ACTUAL %d\n", frame.seqno);
+            /* Check if the the data frame is the same as expected */
+            if (frame.seqno == frameExpected[link]) 
+            {    
+                printf("\t\t\t\tDATA received with seqno=%d, from link %d\n", frame.seqno, link);
+                /* Expect the next frame */
+                frameExpected[link] = ++frameExpected[link] % MAX_SEQ_NUM;
+
+                /* Create an acknowledgment frame for the data frame received */
+                ack.kind = DL_ACK;
+                ack.seqno = frame.seqno;
+                ack.length = 0;
+                ack.checksum = 0;
+                ack.checksum = CNET_ccitt((unsigned char *)&ack, sizeof(ack));
+                
+                /* Send acknowledgment frame */
+                datalink_downto_physical(ack, link);
+                
+                datalink_upto_network(link, frame);
+            }
+            /* If the frames dont match then retransmit frame */
+            else
+                printf("Frame out of order. Ignored\n");
+    	break;
+    }
+}
+
+void datalink_upto_network(int link, Frame frame)
+{
+    Packet packet = frame.packet;
+
+    /* Check if packet is at the correct address */
+    if (nodeinfo.nodenumber == packet.dest_addr)
+    {
+        network_upto_application(link, packet);
+    }
+    else 
+    {
+        /* Resend packet if it hasn't reached its final destination */
+        network_downto_datalink(packet);
+    }
+}
+
+void network_upto_application(int link, Packet packet)
+{   
+    MSG message = packet.data;
+    size_t length = packet.msglen;
+
+    printf("\tReceived %d bytes on link %d - with message \"%s\"\n", length, link, message.data);
+
+    CHECK(CNET_write_application((char*)&message.data, &length));
+}
+
+/* Implementing Go-back-N */
+EVENT_HANDLER(timeouts)
+{
+    int link = (int)data;
+    Frame frame;
+    LinkedListNode* current = frameQueue[link]->head;
+
+    /* Resend the frame that timed out */
+    frame = current->frame;
+
+    printf("Timeout, of seqno=%d on link %d\n", frame.seqno, link);
+    datalink_downto_physical(frame, link);
+    current = current->next;
+    /* Resend all the frames after the timed out frame */
+    while (current != NULL)
+    {
+        frame = current->frame;
+        printf("TIMERID = %d", lasttimer[link][frame.seqno]);
+        CHECK(CNET_stop_timer(lasttimer[link][frame.seqno]));
+
+        datalink_downto_physical(frame, link);
+        current = current->next;
+    }   
+}
+
+EVENT_HANDLER(showstate)
+{
+    int i;
+
+    printf("\n\n##########  STATE OF NODE %d###########\n\n", nodeinfo.nodenumber);
+    for (i = 1; i <= nodeinfo.nlinks; i++)
+    {
+        printf("\nLINK %d", i);
+        printf("\n\tackExpected\t= %d\n\tnextFrameToSend\t= %d\n\tframeExpected\t= %d\n",
+            ackExpected[i], nextFrameToSend[i], frameExpected[i]);
+        printQueue(frameQueue[i]);
+        printf("\nOVERFLOW\n");
+        printQueue(overflowQueue[i]);
+    }
+}
+
+
+EVENT_HANDLER(reboot_node)
+{
+    int i;
+
+    if (setup == TRUE)
+    {
+        ackExpected = (int*)calloc(nodeinfo.nlinks + 1, sizeof(int));
+        frameExpected = (int*)calloc(nodeinfo.nlinks + 1, sizeof(int));
+        nextFrameToSend = (int*)calloc(nodeinfo.nlinks + 1, sizeof(int));
+        lasttimer = (CnetTimerID**)calloc(nodeinfo.nlinks + 1, sizeof(CnetTimerID*));
+        frameQueue = (LinkedList**)calloc(nodeinfo.nlinks + 1, sizeof(LinkedList*));
+        overflowQueue = (LinkedList**)calloc(nodeinfo.nlinks + 1, sizeof(LinkedList*));
+        CNET_enable_application(ALLNODES);
+        for (i = 0; i <= nodeinfo.nlinks; i++)
+        {
+            frameQueue[i] = createQueue();
+            overflowQueue[i] = createQueue();
+            lasttimer[i] = (CnetTimerID*)calloc(MAX_SEQ_NUM, sizeof(CnetTimerID));
+        }
+        setup = FALSE;
+    }
+
+    /* Call application_downto_network function whenever the EV_APPLICATIONREADY1 event occurs*/
+    CHECK(CNET_set_handler( EV_APPLICATIONREADY, application_downto_network, 0));
+    /* Call physical_ready function whenever the EV_PHYSICALREADY event occurs*/
+    CHECK(CNET_set_handler( EV_PHYSICALREADY, physical_upto_datalink, 0));
+    /* Call timeouts function whenever the EV_TIMER1 event occurs*/
+    CHECK(CNET_set_handler( EV_TIMER1, timeouts, data));
+    /* Call showstate function whenever the EV_DEBUG1 event occurs*/
+    CHECK(CNET_set_handler( EV_DEBUG0, showstate, 0));
+    CHECK(CNET_set_debug_string( EV_DEBUG0, "State"));
+}
+
+
+LinkedList* createQueue()
+{
+    LinkedList* list = (LinkedList*)malloc(sizeof(LinkedList));
+    list->head = NULL;
+    list->tail = NULL;
+    list->size = 0;
+    
+    return list;
+}
+
+/** Creates a new node and inserts it at the end of the list.
+*/
+void addFrame(LinkedList* list, Frame frame)
+{
+    LinkedListNode* newNode = (LinkedListNode*)malloc(sizeof(LinkedListNode));
+    /*LinkedListNode* temp = list->head;*/
+    newNode->frame = frame;
+    newNode->next = NULL;
+
+    ++list->size;
+
+    /*If there are currently no nodes in the list.*/
+    if (list->head == NULL)
+    {
+        list->head = newNode;
+        list->tail = newNode;
+    }
+    /*If there is one or more nodes in the list.*/
+    else
+    {
+        list->tail->next = newNode;
+        list->tail = newNode;
+    }
+}
+
+void removeFrame(LinkedList* list)
+{
+    LinkedListNode* temp = list->head;
+
+    list->size--;
+
+    if (list->head != NULL)
+    {
+        list->head = (list->head)->next;
+    }
+    free(temp);
+}
+
+void printQueue(LinkedList* list)
+{
+    /*current points to the first node in the list. */ 
+    LinkedListNode* current = list->head;
+
+    /*Iterate through the linked list and print the data field. */ 
+    while (current != NULL)
+    {
+        printf("Seqno: %d\n", current->frame.seqno);
+        current = current->next;
+    }
+}
+
+Frame peekFirst(LinkedList* list)
+{
+    return list->head->frame;
+}
