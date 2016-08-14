@@ -4,5 +4,5 @@ outputs and this readme file.
 
 All the code required to run the assignment is located in assignment.c and assignment.h.
 
-1. To run the assignment, make sure you are in the assignment directory and run the command: cnet TOPOLOGY.
+1. To run the assignment, make sure you are in the assignment directory and run the command: cnet TOPOLOGY (Requires CNET installed on your computer).
 2. Once the cnet windows open, target the topology window and hit space bar.
